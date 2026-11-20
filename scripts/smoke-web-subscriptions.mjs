@@ -16,14 +16,13 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 const require = createRequire(import.meta.url);
 const { SCOPES } = require("../electron/chatgpt.cjs");
 const sdk = (file) => import(pathToFileURL(path.join(ROOT, "node_modules/@earendil-works/pi-ai/dist", file)));
-const { createModels } = await sdk("index.js");
-const { builtinProviders } = await sdk("providers/all.js");
 const { githubCopilotProvider } = await sdk("providers/github-copilot.js");
-const models = createModels();
-for (const provider of builtinProviders()) models.setProvider(provider);
-const model = models.getModels("openai").find((entry) => entry.api === "openai-responses");
 const copilot = githubCopilotProvider().getModels()[0];
-assert(model && copilot, "Installed SDK catalogs required.");
+assert(copilot, "Installed Copilot SDK catalog required.");
+const chatGPTModelIds = ["gpt-6.1-terra", "gpt-6.2-astra", "gpt-6.2-sol"];
+const accountModels = [...chatGPTModelIds, "unknown-fixture-model"].map((slug) => ({
+	slug, display_name: `Offline fixture ${slug}`, visibility: "list",
+}));
 
 const profile = await fs.mkdtemp(path.join(os.tmpdir(), "lh-web-runtime-"));
 await fs.chmod(profile, 0o700);
@@ -33,7 +32,7 @@ const preload = path.join(profile, "offline-fetch.mjs");
 await fs.writeFile(preload, `const original = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
  const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
- if (url.href === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: ${JSON.stringify(model.id)}, display_name: 'Offline fixture ChatGPT', visibility: 'list' }] });
+ if (url.href === 'https://api.openai.com/v1/models') return Response.json({ models: ${JSON.stringify(accountModels)} });
  if (['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return original(input, init);
  throw new Error('Offline subscription gate forbids external network: ' + url.origin + url.pathname);
 };\n`, { mode: 0o600 });
@@ -66,7 +65,7 @@ async function run(mode) {
 	}), { mode: 0o600 });
 	const port = await freePort(), origin = `http://localhost:${port}`;
 	let logs = "", exited = false;
-	const child = spawn(process.execPath, [path.join(ROOT, "node_modules/next/dist/bin/next"), mode, "-p", String(port)], { cwd: ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
+	const child = spawn(process.execPath, [path.join(ROOT, "node_modules/next/dist/bin/next"), mode, "-H", "localhost", "-p", String(port)], { cwd: ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
 	const exit = new Promise((resolve) => child.once("exit", () => { exited = true; resolve(); }));
 	try {
 		await timeout(new Promise((resolve, reject) => {
@@ -80,8 +79,9 @@ async function run(mode) {
 			signal: AbortSignal.timeout(60000),
 		});
 		// Controls have not been imported through an HTTP request yet.
-		const catalog = (await (await request("/api/models")).json()).providers;
-		for (const id of ["chatgpt", "github-copilot-subscription", "xai-subscription"]) assert(catalog.find((provider) => provider.id === id)?.keyPresent, `${mode}: cold ${id} unavailable.`);
+		const catalog = await (await request("/api/models")).json();
+		assert.deepEqual(catalog.models.filter((model) => model.provider === "chatgpt").map((model) => model.id).sort(), chatGPTModelIds, `${mode}: account-offered ChatGPT catalog.`);
+		for (const id of ["chatgpt", "github-copilot-subscription", "xai-subscription"]) assert(catalog.providers.find((provider) => provider.id === id)?.keyPresent, `${mode}: cold ${id} unavailable.`);
 		let state = await (await request("/api/subscriptions")).json();
 		assert.equal(state.chatgpt.accounts[0].email, "fixture@example.invalid"); assert.equal(state.native.length, 2);
 		for (const secret of ["fixture-chatgpt-access", "fixture-chatgpt-refresh", "fixture-id-token", "fixture-xai-access", "fixture-refresh"]) assert(!JSON.stringify(state).includes(secret));
